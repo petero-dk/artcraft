@@ -99,11 +99,18 @@ jobs:
           }
           "LIBCLANG_PATH=$llvmDirectory" | Add-Content $env:GITHUB_ENV
           'CMAKE_GENERATOR=Ninja Multi-Config' | Add-Content $env:GITHUB_ENV
+          "CMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/script/artcraft/windows_static_crt.cmake" | Add-Content $env:GITHUB_ENV
           'CC=clang-cl' | Add-Content $env:GITHUB_ENV
           'CXX=clang-cl' | Add-Content $env:GITHUB_ENV
 
       - name: test Windows build scripts
-        run: pwsh -NoProfile -File ./script/artcraft/windows_build.test.ps1
+        run: |
+          $testArguments = @('-NoProfile', '-File', './script/artcraft/windows_build.test.ps1')
+          if ('${{ matrix.node_arch }}' -eq 'arm64') {
+            $testArguments += @('-CMakePath', (Get-Command cmake -ErrorAction Stop).Source, '-NinjaPath', (Get-Command ninja -ErrorAction Stop).Source)
+          }
+          & pwsh @testArguments
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: check and test ARM64 native HTTP dependencies
         if: matrix.node_arch == 'arm64'

@@ -1,3 +1,8 @@
+param(
+  [string]$CMakePath,
+  [string]$NinjaPath
+)
+
 $ErrorActionPreference = 'Stop'
 $global:artcraftBuildTestState = @{}
 function Invoke-BuildTests {
@@ -182,6 +187,53 @@ function Invoke-ArchitectureTests {
   }
 }
 
+function Invoke-StaticCrtTests {
+  $fixtureDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
+  New-Item -ItemType Directory -Path $fixtureDirectory | Out-Null
+  try {
+    $project = @'
+cmake_minimum_required(VERSION 3.10)
+project(StaticCrtFixture LANGUAGES C CXX)
+add_library(crt_fixture STATIC fixture.c fixture.cpp)
+'@
+    [System.IO.File]::WriteAllText((Join-Path $fixtureDirectory 'CMakeLists.txt'), $project)
+    [System.IO.File]::WriteAllText((Join-Path $fixtureDirectory 'fixture.c'), 'int crt_fixture_c(void) { return 0; }')
+    [System.IO.File]::WriteAllText((Join-Path $fixtureDirectory 'fixture.cpp'), 'int crt_fixture_cpp() { return 0; }')
+    $compilerPath = (Get-Command node -ErrorAction Stop).Source
+    $configureArguments = @(
+      '-S', $fixtureDirectory, '-B', (Join-Path $fixtureDirectory 'build'),
+      '-G', 'Ninja Multi-Config',
+      "-DCMAKE_MAKE_PROGRAM=$NinjaPath",
+      "-DCMAKE_TOOLCHAIN_FILE=$(Join-Path $PSScriptRoot 'windows_static_crt.cmake')",
+      '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON'
+    )
+    foreach ($language in @('C', 'CXX')) {
+      $configureArguments += @(
+        "-DCMAKE_${language}_COMPILER=$compilerPath",
+        "-DCMAKE_${language}_COMPILER_ID=Clang",
+        "-DCMAKE_${language}_COMPILER_ID_RUN=TRUE",
+        "-DCMAKE_${language}_COMPILER_FORCED=TRUE",
+        "-DCMAKE_${language}_COMPILER_VERSION=22.1.0",
+        "-DCMAKE_${language}_COMPILER_FRONTEND_VARIANT=MSVC",
+        "-DCMAKE_${language}_SIMULATE_ID=MSVC",
+        "-DCMAKE_${language}_SIMULATE_VERSION=19.40",
+        "-DCMAKE_${language}_COMPILER_ARCHITECTURE_ID=ARM64"
+      )
+    }
+    & $CMakePath @configureArguments
+    Assert-True ($LASTEXITCODE -eq 0) 'Static CRT fixture must configure successfully'
+    $commands = Get-Content (Join-Path $fixtureDirectory 'build/compile_commands.json') | ConvertFrom-Json
+    Assert-True ($commands.Count -ge 4) 'CMake must emit C/C++ commands for multiple configurations'
+    foreach ($command in $commands) {
+      Assert-True ($command.command -match '(?:^|\s)[/-]MT(?:\s|$)') "CMake must use the static non-debug CRT: $($command.command)"
+      Assert-True ($command.command -notmatch '(?:^|\s)[/-](?:MDd?|MTd)(?:\s|$)') "CMake must not select a DLL or debug CRT: $($command.command)"
+    }
+    Write-Host 'Windows CMake static CRT configuration tests passed.'
+  } finally {
+    Remove-Item $fixtureDirectory -Recurse -Force
+  }
+}
+
 function Assert-True([bool]$condition, [string]$message) {
   if (-not $condition) { throw $message }
 }
@@ -219,3 +271,7 @@ function npx {
 
 Invoke-BuildTests
 Invoke-ArchitectureTests
+if ($CMakePath) {
+  if (-not $NinjaPath) { throw '-NinjaPath is required for the CMake configuration test.' }
+  Invoke-StaticCrtTests
+}

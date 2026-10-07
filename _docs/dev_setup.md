@@ -115,7 +115,13 @@ The Windows publish workflow builds x64 on `windows-latest` and ARM64 on
 `windows-11-arm`. It can also be started with `workflow_dispatch`; this still
 creates or updates the normal **draft** `artcraft-v<version>` release. ARM64 CI
 uses native LLVM and clang-cl with Ninja Multi-Config, preserving the MSVC
-library directory layout expected by the locked BoringSSL dependency. It runs
+library directory layout expected by the locked BoringSSL dependency. The
+`windows_static_crt.cmake` toolchain selects the non-debug static CRT (`/MT`)
+for native C/C++ dependencies in every configuration, matching Rust's
+`+crt-static` even for debug tests. Its rules override also handles BoringSSL's
+older CMake policy mode, which otherwise adds `/MDd` in Debug and causes
+unresolved `__imp_*` CRT symbols when linking the Rust tests. ARM64 CI checks
+generated C/C++ compiler commands before building those dependencies. It runs
 the native HTTP dependency tests, checks the application PE machine type, and
 smoke-tests a separately built no-bundle ARM64 executable before publication.
 Installers and staged executables are also retained as Actions artifacts.
@@ -142,6 +148,10 @@ pwsh -NoProfile -File .\script\artcraft\windows_build.test.ps1
 
 They cover target arguments, OS architecture defaults, Cargo output paths,
 preserved flags, failure handling, and acceptance/rejection of PE architectures.
+The optional `-CMakePath` and `-NinjaPath` parameters also run a configure-only
+fixture with a simulated clang-cl compiler identity, verifying the generated
+runtime flags without compiling native code. This complements, rather than
+replaces, linking and running the real Rust dependency tests in ARM64 CI.
 To inspect a real application payload independently:
 
 ```powershell
