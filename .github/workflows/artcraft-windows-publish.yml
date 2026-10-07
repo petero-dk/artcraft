@@ -1,6 +1,7 @@
 name: "Artcraft Windows Publish"
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - release
@@ -20,28 +21,96 @@ jobs:
         include:
           # Windows builds
           - platform: 'windows-latest'
-            args: ''
+            target: 'x86_64-pc-windows-msvc'
+            node_arch: 'x64'
+            args: '--target x86_64-pc-windows-msvc -- --locked'
+          - platform: 'windows-11-arm'
+            target: 'aarch64-pc-windows-msvc'
+            node_arch: 'arm64'
+            args: '--target aarch64-pc-windows-msvc --bundles nsis -- --locked'
 
     runs-on: ${{ matrix.platform }}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RUSTFLAGS: '-C target-feature=+crt-static'
+      SQLX_OFFLINE: 'true'
+      VITE_ENVIRONMENT_TYPE: 'production'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      ARTCRAFT_WINDOWS_TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v4
 
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: install wreq dependencies
+        if: matrix.node_arch == 'x64'
         run: |
-          choco install cmake -y
-          choco install strawberryperl -y
-          choco install pkgconfiglite -y
-          choco install llvm -y
-          choco install nasm -y
-        shell: cmd
+          foreach ($package in @('cmake', 'strawberryperl', 'pkgconfiglite', 'llvm', 'nasm')) {
+            choco install $package -y
+            if ($LASTEXITCODE -notin @(0, 3010)) { throw "Failed to install $package" }
+          }
+
+      - name: configure native ARM64 build tools
+        if: matrix.node_arch == 'arm64'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $hostInfo = rustc -vV
+          if ($LASTEXITCODE -ne 0 -or $hostInfo -notcontains 'host: aarch64-pc-windows-msvc') {
+            throw 'The ARM64 job requires a native ARM64 Rust host.'
+          }
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          $vsPath = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $vsPath) { throw 'ARM64 MSVC tools are missing.' }
+          Import-Module "$vsPath/Common7/Tools/Microsoft.VisualStudio.DevShell.dll"
+          Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments '-arch=arm64 -host_arch=arm64'
+          $llvmDirectory = $null
+          foreach ($candidate in @("$env:ProgramFiles/LLVM/bin", "$vsPath/VC/Tools/Llvm/ARM64/bin")) {
+            $libclang = Join-Path $candidate 'libclang.dll'
+            if (-not (Test-Path $libclang)) { continue }
+            try {
+              ./script/artcraft/verify_windows_binary.ps1 -BinaryPath $libclang -Target '${{ matrix.target }}' -AllowDll
+              $llvmDirectory = $candidate
+              break
+            } catch {
+              Write-Host "Skipping incompatible libclang at ${candidate}: $_"
+            }
+          }
+          if (-not $llvmDirectory) { throw 'A native ARM64 libclang.dll is required by bindgen.' }
+          $env:PATH = "$llvmDirectory;$env:PATH"
+          foreach ($tool in @('cl', 'cmake', 'clang-cl', 'llvm-readobj', 'perl', 'go', 'ninja')) {
+            Get-Command $tool -ErrorAction Stop | Select-Object Name, Source
+          }
+          $env:PATH -split ';' | Where-Object { $_ } | Add-Content $env:GITHUB_PATH
+          foreach ($name in @('INCLUDE', 'LIB', 'LIBPATH', 'VCINSTALLDIR', 'VSINSTALLDIR', 'WindowsSdkDir', 'WindowsSDKVersion')) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if ($value) { "$name=$value" | Add-Content $env:GITHUB_ENV }
+          }
+          "LIBCLANG_PATH=$llvmDirectory" | Add-Content $env:GITHUB_ENV
+          'CMAKE_GENERATOR=Ninja Multi-Config' | Add-Content $env:GITHUB_ENV
+          'CC=clang-cl' | Add-Content $env:GITHUB_ENV
+          'CXX=clang-cl' | Add-Content $env:GITHUB_ENV
+
+      - name: test Windows build scripts
+        run: pwsh -NoProfile -File ./script/artcraft/windows_build.test.ps1
+
+      - name: check and test ARM64 native HTTP dependencies
+        if: matrix.node_arch == 'arm64'
+        run: |
+          cargo check --locked -p browser_emulation --target '${{ matrix.target }}'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p browser_emulation --target '${{ matrix.target }}'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: setup node
         uses: actions/setup-node@v4
         with:
           node-version: lts/*
+          architecture: ${{ matrix.node_arch }}
 
       - name: install frontend dependencies
         run: |
@@ -52,6 +121,7 @@ jobs:
 
           echo "Installing all workspace dependencies..."
           npm ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           echo "=== Version Information ==="
           echo "Node version:"
@@ -89,19 +159,80 @@ jobs:
           $config.build.beforeBuildCommand = ""
           $config | ConvertTo-Json -Depth 10 | Set-Content tauri.conf.json
 
+      - name: build and verify unbundled application
+        id: native
+        working-directory: ./crates/desktop/artcraft
+        run: |
+          & '${{ github.workspace }}/script/artcraft/windows_tauri_cli.ps1' build --target '${{ matrix.target }}' --no-bundle -- --locked
+          $binary = Join-Path $env:CARGO_TARGET_DIR '${{ matrix.target }}/release/artcraft.exe'
+          $version = (Get-Content tauri.conf.json | ConvertFrom-Json).version
+          $staging = Join-Path '${{ runner.temp }}' 'artcraft-standalone'
+          New-Item -ItemType Directory -Path $staging -Force | Out-Null
+          $asset = Join-Path $staging "ArtCraft_${version}_windows_${{ matrix.node_arch }}.exe"
+          Copy-Item $binary $asset
+          "asset=$asset" | Add-Content $env:GITHUB_OUTPUT
+
+      - name: smoke-test standalone ARM64 application
+        if: matrix.node_arch == 'arm64'
+        env:
+          ASSET_PATH: ${{ steps.native.outputs.asset }}
+        run: |
+          $imports = llvm-readobj --coff-imports $env:ASSET_PATH
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $imports | Write-Host
+          $releaseDirectory = Join-Path $env:CARGO_TARGET_DIR '${{ matrix.target }}/release'
+          foreach ($line in $imports) {
+            if ($line -match '^\s*Name: (\S+\.dll)$' -and (Test-Path (Join-Path $releaseDirectory $Matches[1]))) {
+              throw "Standalone application requires companion DLL: $($Matches[1])"
+            }
+          }
+          $application = Start-Process -FilePath $env:ASSET_PATH -WorkingDirectory (Split-Path $env:ASSET_PATH) -PassThru
+          try {
+            if ($application.WaitForExit(15000)) {
+              throw "Standalone application exited during startup: $($application.ExitCode)"
+            }
+          } finally {
+            if (-not $application.HasExited) { Stop-Process -Id $application.Id -Force }
+            $application.Dispose()
+          }
+
       - name: build and publish
+        id: publish
         uses: tauri-apps/tauri-action@v0
         env:
-          # NB(bt): This is needed by wreq. Hopefully it doesn't kill Tauri
-          RUSTFLAGS: "-C target-feature=+crt-static"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Use the SQLx query cache for SQLite
-          SQLX_OFFLINE: true
         with:
           projectPath: ./crates/desktop/artcraft
+          tauriScript: pwsh -NoProfile -File ../../../script/artcraft/windows_tauri_cli.ps1
           tagName: artcraft-v__VERSION__ # the action automatically replaces __VERSION__ with the app version.
           releaseName: "ArtCraft v__VERSION__"
           releaseBody: "Production build of ArtCraft. See the assets below to download and install."
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+      - name: upload standalone ARM64 executable to the release
+        if: matrix.node_arch == 'arm64'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          ASSET_PATH: ${{ steps.native.outputs.asset }}
+          APP_VERSION: ${{ steps.publish.outputs.appVersion }}
+          RELEASE_ID: ${{ steps.publish.outputs.releaseId }}
+        run: |
+          ./script/artcraft/verify_windows_binary.ps1 -BinaryPath $env:ASSET_PATH -Target '${{ matrix.target }}'
+          $tag = gh api "repos/$env:GH_REPO/releases/$env:RELEASE_ID" --jq '.tag_name'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($tag -ne "artcraft-v$env:APP_VERSION") { throw 'Unexpected release tag.' }
+          gh release upload $tag $env:ASSET_PATH --clobber
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: retain Windows distribution artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artcraft-windows-${{ matrix.node_arch }}
+          if-no-files-found: error
+          path: |
+            ${{ github.workspace }}/target/${{ matrix.target }}/release/bundle/nsis/*.exe
+            ${{ github.workspace }}/target/${{ matrix.target }}/release/bundle/msi/*.msi
+            ${{ steps.native.outputs.asset }}

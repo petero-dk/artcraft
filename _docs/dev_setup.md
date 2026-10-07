@@ -80,6 +80,76 @@ without restarting the Rust process.
 .\script\artcraft\windows_rust_dev.ps1
 ```
 
+**Windows Production Builds (x64 and ARM64)**
+
+Use PowerShell 7 and install Rust, the Tauri CLI, Node.js, Visual Studio's C++
+build tools, and a Windows SDK. ARM64 builds additionally require the MSVC ARM64
+build tools. The native HTTP clients need CMake, LLVM (including `libclang.dll`),
+Perl, and Go; x64 builds also use NASM. On ARM64, bindgen must load an ARM64
+`libclang.dll` when using native ARM64 Rust, even if an x64 PowerShell or installer
+is running under emulation. Set `LIBCLANG_PATH` to its directory if discovery fails.
+
+```powershell
+rustup target add aarch64-pc-windows-msvc
+.\script\artcraft\windows_build.ps1 -Target aarch64-pc-windows-msvc
+
+rustup target add x86_64-pc-windows-msvc
+.\script\artcraft\windows_build.ps1 -Target x86_64-pc-windows-msvc
+```
+
+Omitting `-Target` selects the Windows OS architecture, not the shell's process
+architecture. Use `-NoOpen` to skip opening Explorer. Native ARM64 builds are the
+CI path; cross-compiling on x64 needs ARM64 MSVC tools and separate verification
+of the native TLS dependencies. The script preserves existing `RUSTFLAGS`, adds
+the static CRT flag required by the Windows HTTP build, uses the lockfile and
+SQLx offline mode, and stops if dependency installation or compilation fails.
+
+The application is in `<cargo-target-directory>/<target>/release/artcraft.exe`.
+NSIS installers are in that directory's `bundle/nsis/` subdirectory. The script
+uses Cargo metadata for the target directory, including `CARGO_TARGET_DIR` or
+Cargo configuration overrides. ARM64 selects NSIS; x64 keeps the configured
+installer types. The NSIS setup program is x86 and runs under Windows emulation,
+but its installed ARM64 application is native.
+
+The Windows publish workflow builds x64 on `windows-latest` and ARM64 on
+`windows-11-arm`. It can also be started with `workflow_dispatch`; this still
+creates or updates the normal **draft** `artcraft-v<version>` release. ARM64 CI
+uses native LLVM and clang-cl with Ninja Multi-Config, preserving the MSVC
+library directory layout expected by the locked BoringSSL dependency. It runs
+the native HTTP dependency tests, checks the application PE machine type, and
+smoke-tests a separately built no-bundle ARM64 executable before publication.
+Installers and staged executables are also retained as Actions artifacts.
+
+The ARM64 release includes `ArtCraft_<version>_windows_arm64.exe` in addition to
+the installer. The standalone executable requires an installed **ARM64 WebView2
+Runtime**; unlike the installer, it does not provision that runtime. CI rejects
+directly imported companion DLLs found in the app output and checks that the
+staged app stays alive during startup. This is not a guarantee of full portable
+operation or a substitute for clean-machine testing.
+
+Before publishing the draft release, test on Windows ARM64 without development
+tools: install, launch, confirm the application runs as ARM64, verify login and
+media loading, test the standalone executable with WebView2 installed, and
+uninstall. Also verify an existing x64 installation can transition without
+losing account/session data. Preserve the current Windows signing policy;
+unsigned downloads may still trigger SmartScreen warnings.
+
+Run the focused script tests without Rust compilation or opening the app:
+
+```powershell
+pwsh -NoProfile -File .\script\artcraft\windows_build.test.ps1
+```
+
+They cover target arguments, OS architecture defaults, Cargo output paths,
+preserved flags, failure handling, and acceptance/rejection of PE architectures.
+To inspect a real application payload independently:
+
+```powershell
+.\script\artcraft\verify_windows_binary.ps1 `
+	-BinaryPath .\target\aarch64-pc-windows-msvc\release\artcraft.exe `
+	-Target aarch64-pc-windows-msvc
+```
+
 Backend services and website builds live in the separate `artcraft-services` repository.
 This repository retains the desktop task database in
 `_database/sql/artcraft_migrations/` and its SQLite query cache in `.sqlx/`.
