@@ -19,11 +19,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Windows builds
-          - platform: 'windows-latest'
-            target: 'x86_64-pc-windows-msvc'
-            node_arch: 'x64'
-            args: '--target x86_64-pc-windows-msvc -- --locked'
+          # Temporarily disabled; uncomment to restore x64 builds.
+          # - platform: 'windows-latest'
+          #   target: 'x86_64-pc-windows-msvc'
+          #   node_arch: 'x64'
+          #   args: '--target x86_64-pc-windows-msvc -- --locked'
           - platform: 'windows-11-arm'
             target: 'aarch64-pc-windows-msvc'
             node_arch: 'arm64'
