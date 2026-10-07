@@ -73,9 +73,18 @@ function Invoke-ArchitectureTests {
   $cliScript = Join-Path $PSScriptRoot 'windows_tauri_cli.ps1'
   $originalTargetDirectory = $env:CARGO_TARGET_DIR
   $originalWindowsTarget = $env:ARTCRAFT_WINDOWS_TARGET
+  $originalPath = $env:PATH
+  $originalCapturePath = $env:ARTCRAFT_CLI_TEST_CAPTURE_PATH
   $fixtureDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
   New-Item -ItemType Directory -Path $fixtureDirectory | Out-Null
   try {
+    $shimDirectory = Join-Path $fixtureDirectory 'mock tools'
+    New-Item -ItemType Directory -Path $shimDirectory | Out-Null
+    $nodePath = (Get-Command node -ErrorAction Stop).Source
+    [System.IO.File]::WriteAllText((Join-Path $shimDirectory 'npx.cmd'), "@echo off`r`n`"$nodePath`" `"%~dp0capture-npx.cjs`" %*`r`n")
+    [System.IO.File]::WriteAllText((Join-Path $shimDirectory 'capture-npx.cjs'), "require('node:fs').writeFileSync(process.env.ARTCRAFT_CLI_TEST_CAPTURE_PATH, JSON.stringify(process.argv.slice(2)));")
+    $env:PATH = "$shimDirectory;$originalPath"
+    $env:ARTCRAFT_CLI_TEST_CAPTURE_PATH = Join-Path $fixtureDirectory 'captured-arguments.json'
     $bytes = [System.IO.File]::ReadAllBytes((Get-Process -Id $PID).Path)
     $reader = [System.Reflection.PortableExecutable.PEReader]::new([System.IO.MemoryStream]::new($bytes))
     try {
@@ -96,9 +105,19 @@ function Invoke-ArchitectureTests {
       New-Item -ItemType Directory -Path $releaseDirectory -Force | Out-Null
       $application = Join-Path $releaseDirectory 'artcraft.exe'
       Copy-Item $fixture $application
-      & $cliScript build --target $target --no-bundle -- --locked
-      Assert-True ($global:artcraftBuildTestState.cliArguments -contains $target) 'CLI wrapper must forward the target'
-      Assert-True ($global:artcraftBuildTestState.cliArguments[-1] -eq '--locked') 'CLI wrapper must forward Cargo arguments'
+      & $cliScript build --target $target --no-bundle '--' --locked
+      $expectedArguments = @('--yes', '--package', '@tauri-apps/cli@2.10.0', 'tauri', 'build', '--target', $target, '--no-bundle', '--', '--locked')
+      Assert-True (($global:artcraftBuildTestState.cliArguments | ConvertTo-Json -Compress) -eq ($expectedArguments | ConvertTo-Json -Compress)) 'CLI wrapper must preserve the complete argument list, including the Cargo separator'
+      $releaseArguments = @('build', '--target', $target)
+      if ($target -eq 'aarch64-pc-windows-msvc') {
+        $releaseArguments += @('--bundles', 'nsis')
+      }
+      $releaseArguments += @('--', '--locked')
+      & (Get-Process -Id $PID).Path -NoProfile -File $cliScript @releaseArguments
+      Assert-True ($LASTEXITCODE -eq 0) 'Release action invocation must succeed through pwsh -File'
+      $capturedArguments = Get-Content $env:ARTCRAFT_CLI_TEST_CAPTURE_PATH | ConvertFrom-Json
+      $expectedArguments = @('--yes', '--package', '@tauri-apps/cli@2.10.0', 'tauri') + $releaseArguments
+      Assert-True (($capturedArguments | ConvertTo-Json -Compress) -eq ($expectedArguments | ConvertTo-Json -Compress)) 'Release action invocation must preserve every native CLI argument'
       $otherTarget = if ($target -eq 'aarch64-pc-windows-msvc') { 'x86_64-pc-windows-msvc' } else { 'aarch64-pc-windows-msvc' }
       $caught = $false
       try {
@@ -157,6 +176,8 @@ function Invoke-ArchitectureTests {
   } finally {
     $env:CARGO_TARGET_DIR = $originalTargetDirectory
     $env:ARTCRAFT_WINDOWS_TARGET = $originalWindowsTarget
+    $env:PATH = $originalPath
+    $env:ARTCRAFT_CLI_TEST_CAPTURE_PATH = $originalCapturePath
     Remove-Item $fixtureDirectory -Recurse -Force
   }
 }

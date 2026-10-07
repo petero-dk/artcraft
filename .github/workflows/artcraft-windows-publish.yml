@@ -85,7 +85,14 @@ jobs:
           foreach ($tool in @('cl', 'cmake', 'clang-cl', 'llvm-readobj', 'perl', 'go', 'ninja')) {
             Get-Command $tool -ErrorAction Stop | Select-Object Name, Source
           }
-          $env:PATH -split ';' | Where-Object { $_ } | Add-Content $env:GITHUB_PATH
+          $msvcDirectory = Split-Path (Get-Command cl.exe -ErrorAction Stop).Source
+          $linker = Join-Path $msvcDirectory 'link.exe'
+          if (-not (Test-Path $linker)) { throw "MSVC linker is missing: $linker" }
+          ./script/artcraft/verify_windows_binary.ps1 -BinaryPath $linker -Target '${{ matrix.target }}'
+          "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=$linker" | Add-Content $env:GITHUB_ENV
+          $pathEntries = @($env:PATH -split ';' | Where-Object { $_ })
+          [Array]::Reverse($pathEntries)
+          $pathEntries | Add-Content $env:GITHUB_PATH
           foreach ($name in @('INCLUDE', 'LIB', 'LIBPATH', 'VCINSTALLDIR', 'VSINSTALLDIR', 'WindowsSdkDir', 'WindowsSDKVersion')) {
             $value = [Environment]::GetEnvironmentVariable($name)
             if ($value) { "$name=$value" | Add-Content $env:GITHUB_ENV }
@@ -163,7 +170,7 @@ jobs:
         id: native
         working-directory: ./crates/desktop/artcraft
         run: |
-          & '${{ github.workspace }}/script/artcraft/windows_tauri_cli.ps1' build --target '${{ matrix.target }}' --no-bundle -- --locked
+          & '${{ github.workspace }}/script/artcraft/windows_tauri_cli.ps1' build --target '${{ matrix.target }}' --no-bundle '--' --locked
           $binary = Join-Path $env:CARGO_TARGET_DIR '${{ matrix.target }}/release/artcraft.exe'
           $version = (Get-Content tauri.conf.json | ConvertFrom-Json).version
           $staging = Join-Path '${{ runner.temp }}' 'artcraft-standalone'
